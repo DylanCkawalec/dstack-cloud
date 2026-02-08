@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 use crate::app::App;
-use anyhow::Result;
 use fs_err as fs;
 use rocket::{
     get,
