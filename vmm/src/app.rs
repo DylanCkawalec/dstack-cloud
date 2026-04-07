@@ -35,6 +35,7 @@ pub use qemu::{VmConfig, VmWorkDir};
 mod id_pool;
 mod image;
 mod qemu;
+pub(crate) mod registry;
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct PortMapping {
@@ -118,16 +119,24 @@ pub struct GpuSpec {
     pub slot: String,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) enum PullStatus {
+    Pulling,
+    Failed(String),
+}
+
 #[derive(Clone)]
 pub struct App {
     pub config: Arc<Config>,
     pub supervisor: SupervisorClient,
     state: Arc<Mutex<AppState>>,
     forward_service: Arc<tokio::sync::Mutex<ForwardService>>,
+    /// Pull status for registry images: tag → status.
+    pub(crate) pull_status: Arc<Mutex<std::collections::HashMap<String, PullStatus>>>,
 }
 
 impl App {
-    fn lock(&self) -> MutexGuard<'_, AppState> {
+    pub(crate) fn lock(&self) -> MutexGuard<'_, AppState> {
         self.state.lock().or_panic("mutex poisoned")
     }
 
@@ -152,6 +161,7 @@ impl App {
             })),
             config: Arc::new(config),
             forward_service: Arc::new(tokio::sync::Mutex::new(ForwardService::new())),
+            pull_status: Arc::new(Mutex::new(std::collections::HashMap::new())),
         }
     }
 
@@ -172,7 +182,7 @@ impl App {
         {
             bail!("Invalid image name");
         }
-        let image_path = self.config.image_path.join(&manifest.image);
+        let image_path = self.config.image.path.join(&manifest.image);
         let image = Image::load(&image_path).context("Failed to load image")?;
         let vm_id = manifest.id.clone();
         let app_compose = vm_work_dir
@@ -242,6 +252,11 @@ impl App {
                     fs::remove_file(path)?;
                 }
             }
+            // Append current serial.log to serial.history.log before QEMU truncates it.
+            rotate_serial_log(&work_dir, self.config.cvm.serial_history_max_bytes);
+            // Add boot separator to stdout/stderr (they are opened in append mode).
+            append_boot_separator(&work_dir.stdout_file());
+            append_boot_separator(&work_dir.stderr_file());
 
             let devices = self.try_allocate_gpus(&vm_config.manifest)?;
             let processes = vm_config.config_qemu(&work_dir, &self.config.cvm, &devices)?;
@@ -287,17 +302,17 @@ impl App {
         // Persist the removing marker so crash recovery can resume
         let work_dir = self.work_dir(id);
         if let Err(err) = work_dir.set_removing() {
-            warn!("Failed to write .removing marker for {id}: {err:?}");
+            warn!("failed to write .removing marker for {id}: {err:?}");
         }
 
         // Clean up port forwarding immediately
         self.cleanup_port_forward(id).await;
 
-        // Spawn background cleanup coroutine
+        // User-initiated removal always deletes the workdir
         let app = self.clone();
         let id = id.to_string();
         tokio::spawn(async move {
-            if let Err(err) = app.finish_remove_vm(&id).await {
+            if let Err(err) = app.finish_remove_vm(&id, true).await {
                 error!("Background cleanup failed for {id}: {err:?}");
             }
         });
@@ -306,8 +321,10 @@ impl App {
     }
 
     /// Background cleanup: stop supervisor process, wait for it to exit,
-    /// remove from supervisor, delete workdir, and free CID.
-    async fn finish_remove_vm(&self, id: &str) -> Result<()> {
+    /// remove from supervisor, optionally delete workdir, and free CID.
+    ///
+    /// `delete_workdir`: true for user-initiated removal, false for orphan cleanup.
+    async fn finish_remove_vm(&self, id: &str, delete_workdir: bool) -> Result<()> {
         // Stop the supervisor process (idempotent if already stopped)
         if let Err(err) = self.supervisor.stop(id).await {
             debug!("supervisor.stop({id}) during removal: {err:?}");
@@ -346,12 +363,20 @@ impl App {
             }
         }
 
-        // Delete the workdir (may already be gone, e.g. manual deletion before reload)
+        // Only delete the workdir for user-initiated removal or if .removing marker exists.
+        // Orphaned supervisor processes without the marker keep their data intact.
         let vm_path = self.work_dir(id);
-        if vm_path.path().exists() {
-            if let Err(err) = fs::remove_dir_all(&vm_path) {
-                error!("Failed to remove VM directory for {id}: {err:?}");
+        if delete_workdir || vm_path.is_removing() {
+            if vm_path.path().exists() {
+                if let Err(err) = fs::remove_dir_all(&vm_path) {
+                    error!("failed to remove VM directory for {id}: {err:?}");
+                }
             }
+        } else if vm_path.path().exists() {
+            info!(
+                "VM {id} workdir preserved (orphan cleanup): {}",
+                vm_path.path().display()
+            );
         }
 
         // Free CID and remove from memory (last step)
@@ -366,7 +391,8 @@ impl App {
         Ok(())
     }
 
-    /// Spawn a background task to clean up a VM (stop + remove from supervisor + delete workdir).
+    /// Spawn a background task to clean up a VM (stop + remove from supervisor).
+    /// Workdir deletion is based on the `.removing` marker (only present for user-initiated removal).
     /// Returns false if a cleanup task is already running for this VM.
     fn spawn_finish_remove(&self, id: &str) -> bool {
         {
@@ -379,12 +405,13 @@ impl App {
                 vm.state.removing = true;
             }
             // If VM is not in memory (e.g. orphaned supervisor process), no entry to guard
-            // but we still need to clean up the supervisor process and workdir.
+            // but we still need to clean up the supervisor process.
         }
         let app = self.clone();
         let id = id.to_string();
         tokio::spawn(async move {
-            if let Err(err) = app.finish_remove_vm(&id).await {
+            // Don't pass delete_workdir=true; rely on .removing marker check inside
+            if let Err(err) = app.finish_remove_vm(&id, false).await {
                 error!("Background cleanup failed for {id}: {err:?}");
             }
         });
@@ -734,7 +761,7 @@ impl App {
         {
             bail!("Invalid image name");
         }
-        let image_path = self.config.image_path.join(&manifest.image);
+        let image_path = self.config.image.path.join(&manifest.image);
         let image = Image::load(&image_path).context("Failed to load image")?;
         let vm_id = manifest.id.clone();
         let already_running = cids_assigned.contains_key(&vm_id);
@@ -849,7 +876,7 @@ impl App {
     }
 
     pub fn list_images(&self) -> Result<Vec<(String, ImageInfo)>> {
-        let image_path = self.config.image_path.clone();
+        let image_path = self.config.image.path.clone();
         let images = fs::read_dir(image_path).context("Failed to read image directory")?;
         Ok(images
             .flat_map(|entry| {
@@ -1051,8 +1078,66 @@ impl App {
     }
 }
 
+/// Append a boot separator line with timestamp to an append-mode log file.
+fn append_boot_separator(path: &std::path::Path) {
+    use std::io::Write;
+    if !path.exists() {
+        return;
+    }
+    let Ok(mut file) = std::fs::OpenOptions::new().append(true).open(path) else {
+        return;
+    };
+    let timestamp = humantime::format_rfc3339_seconds(std::time::SystemTime::now());
+    let _ = writeln!(file, "\n===== boot @ {timestamp} =====\n");
+}
+
+/// Append current serial.log into serial.history.log with a boot separator,
+/// then truncate history if it exceeds `max_bytes`.
+fn rotate_serial_log(work_dir: &VmWorkDir, max_bytes: u64) {
+    use std::io::Write;
+
+    let serial = work_dir.serial_file();
+    if !serial.exists() {
+        return;
+    }
+    let Ok(content) = fs::read(&serial) else {
+        return;
+    };
+    if content.is_empty() {
+        return;
+    }
+    let history = work_dir.serial_history_file();
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&history)
+    else {
+        return;
+    };
+    let timestamp = humantime::format_rfc3339_seconds(std::time::SystemTime::now());
+    let _ = writeln!(file, "\n===== boot @ {timestamp} =====\n");
+    let _ = file.write_all(&content);
+    drop(file);
+
+    // Truncate from the front if history exceeds max_bytes.
+    if let Ok(meta) = fs::metadata(&history) {
+        if meta.len() > max_bytes {
+            if let Ok(data) = fs::read(&history) {
+                let skip = data.len() - max_bytes as usize;
+                // Find the next newline after skip point to avoid cutting mid-line.
+                let start = data[skip..]
+                    .iter()
+                    .position(|&b| b == b'\n')
+                    .map(|p| skip + p + 1)
+                    .unwrap_or(skip);
+                let _ = fs::write(&history, &data[start..]);
+            }
+        }
+    }
+}
+
 pub(crate) fn make_sys_config(cfg: &Config, manifest: &Manifest) -> Result<String> {
-    let image_path = cfg.image_path.join(&manifest.image);
+    let image_path = cfg.image.path.join(&manifest.image);
     let image = Image::load(image_path).context("Failed to load image info")?;
     let img_ver = image.info.version_tuple().unwrap_or((0, 0, 0));
     let kms_urls = if manifest.kms_urls.is_empty() {

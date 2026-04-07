@@ -2,10 +2,9 @@
 //
 // SPDX-License-Identifier: BUSL-1.1
 
-use anyhow::{Context, Result};
-use dstack_guest_agent_rpc::{
-    dstack_guest_client::DstackGuestClient, AttestResponse, RawQuoteArgs,
-};
+use std::sync::{Arc, Mutex};
+
+use anyhow::{bail, Context, Result};
 use dstack_kms_rpc::{
     kms_client::KmsClient,
     onboard_server::{OnboardRpc, OnboardServer},
@@ -13,17 +12,24 @@ use dstack_kms_rpc::{
     OnboardResponse,
 };
 use fs_err as fs;
-use http_client::prpc::PrpcClient;
 use k256::ecdsa::SigningKey;
-use ra_rpc::{client::RaClient, CallContext, RpcCall};
+use ra_rpc::{
+    client::{CertInfo, RaClient, RaClientConfig},
+    CallContext, RpcCall,
+};
 use ra_tls::{
-    attestation::{QuoteContentType, VersionedAttestation},
+    attestation::{PlatformEvidence, QuoteContentType, VerifiedAttestation, VersionedAttestation},
     cert::{CaCert, CertRequest},
     rcgen::{Certificate, KeyPair, PKCS_ECDSA_P256_SHA256},
 };
 use safe_write::safe_write;
 
-use crate::config::KmsConfig;
+use crate::{
+    config::KmsConfig,
+    main_service::upgrade_authority::{
+        app_attest, dstack_client, ensure_kms_allowed, ensure_self_kms_allowed, pad64,
+    },
+};
 
 #[derive(Clone)]
 pub struct OnboardState {
@@ -52,24 +58,22 @@ impl RpcCall<OnboardState> for OnboardHandler {
 
 impl OnboardRpc for OnboardHandler {
     async fn bootstrap(self, request: BootstrapRequest) -> Result<BootstrapResponse> {
-        let quote_enabled = self.state.config.onboard.quote_enabled;
-        let keys = Keys::generate(&request.domain, quote_enabled)
+        ensure_self_kms_allowed(&self.state.config)
+            .await
+            .context("KMS is not allowed to bootstrap")?;
+        let keys = Keys::generate(&request.domain)
             .await
             .context("Failed to generate keys")?;
 
         let k256_pubkey = keys.k256_key.verifying_key().to_sec1_bytes().to_vec();
         let ca_pubkey = keys.ca_key.public_key_der();
-        let attestation = if quote_enabled {
-            Some(attest_keys(&ca_pubkey, &k256_pubkey).await?)
-        } else {
-            None
-        };
+        let attestation = attest_keys(&ca_pubkey, &k256_pubkey).await?;
 
         let cfg = &self.state.config;
         let response = BootstrapResponse {
             ca_pubkey,
             k256_pubkey,
-            attestation: attestation.unwrap_or_default(),
+            attestation,
         };
         // Store the bootstrap info
         safe_write(cfg.bootstrap_info(), serde_json::to_vec(&response)?)?;
@@ -85,9 +89,9 @@ impl OnboardRpc for OnboardHandler {
             format!("{source_url}/prpc")
         };
         let keys = Keys::onboard(
+            &self.state.config,
             &source_url,
             &request.domain,
-            self.state.config.onboard.quote_enabled,
             self.state.config.pccs_url.clone(),
         )
         .await
@@ -107,14 +111,16 @@ impl OnboardRpc for OnboardHandler {
             .context("Failed to get attestation")?;
 
         // Decode and verify the attestation to get real device ID
-        let attestation = VersionedAttestation::from_scale(&response.attestation)
-            .context("Failed to decode attestation")?
-            .into_inner();
-        let attestation_mode = serde_json::to_value(attestation.quote.mode())
-            .ok()
-            .and_then(|v| v.as_str().map(String::from))
-            .unwrap_or_else(|| format!("{:?}", attestation.quote.mode()));
+        let attestation = VersionedAttestation::from_bytes(&response.attestation)
+            .context("Failed to decode attestation")?;
+        let attestation_mode = match &attestation.clone().into_v1().platform {
+            PlatformEvidence::Tdx { .. } => "dstack-tdx",
+            PlatformEvidence::GcpTdx => "dstack-gcp-tdx",
+            PlatformEvidence::NitroEnclave => "dstack-nitro-enclave",
+        }
+        .to_string();
         let verified = attestation
+            .into_v1()
             .verify(pccs_url.as_deref())
             .await
             .context("Failed to verify attestation")?;
@@ -155,12 +161,12 @@ struct Keys {
 }
 
 impl Keys {
-    async fn generate(domain: &str, quote_enabled: bool) -> Result<Self> {
+    async fn generate(domain: &str) -> Result<Self> {
         let tmp_ca_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)?;
         let ca_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)?;
         let rpc_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)?;
         let k256_key = SigningKey::random(&mut rand::rngs::OsRng);
-        Self::from_keys(tmp_ca_key, ca_key, rpc_key, k256_key, domain, quote_enabled).await
+        Self::from_keys(tmp_ca_key, ca_key, rpc_key, k256_key, domain).await
     }
 
     async fn from_keys(
@@ -169,7 +175,6 @@ impl Keys {
         rpc_key: KeyPair,
         k256_key: SigningKey,
         domain: &str,
-        quote_enabled: bool,
     ) -> Result<Self> {
         let tmp_ca_cert = CertRequest::builder()
             .org_name("Dstack")
@@ -187,25 +192,20 @@ impl Keys {
             .key(&ca_key)
             .build()
             .self_signed()?;
-        let attestation = if quote_enabled {
-            let pubkey = rpc_key.public_key_der();
-            let report_data = QuoteContentType::RaTlsCert.to_report_data(&pubkey);
-            let response = app_attest(report_data.to_vec())
-                .await
-                .context("Failed to get quote")?;
-            let attestation = VersionedAttestation::from_scale(&response.attestation)
-                .context("Invalid attestation")?;
-            Some(attestation)
-        } else {
-            None
-        };
+        let pubkey = rpc_key.public_key_der();
+        let report_data = QuoteContentType::RaTlsCert.to_report_data(&pubkey);
+        let response = app_attest(report_data.to_vec())
+            .await
+            .context("Failed to get quote")?;
+        let attestation = VersionedAttestation::from_bytes(&response.attestation)
+            .context("Invalid attestation")?;
 
         // Sign WWW server cert with KMS cert
         let rpc_cert = CertRequest::builder()
             .subject(domain)
             .alt_names(&[domain.to_string()])
             .special_usage("kms:rpc")
-            .maybe_attestation(attestation.as_ref())
+            .maybe_attestation(Some(&attestation))
             .key(&rpc_key)
             .build()
             .signed_by(&ca_cert, &ca_key)?;
@@ -222,21 +222,47 @@ impl Keys {
     }
 
     async fn onboard(
+        cfg: &KmsConfig,
         other_kms_url: &str,
         domain: &str,
-        quote_enabled: bool,
         pccs_url: Option<String>,
     ) -> Result<Self> {
-        let kms_client = RaClient::new(other_kms_url.into(), true)?;
-        let mut kms_client = KmsClient::new(kms_client);
+        let attestation_slot = Arc::new(Mutex::new(None::<VerifiedAttestation>));
+        let attestation_slot_out = attestation_slot.clone();
+        let client = RaClientConfig::builder()
+            .tls_no_check(true)
+            .remote_uri(other_kms_url.to_string())
+            .cert_validator(Box::new(move |info: Option<CertInfo>| {
+                let Some(info) = info else {
+                    bail!("Source KMS did not present a TLS certificate");
+                };
+                let Some(attestation) = info.attestation else {
+                    bail!("Source KMS certificate does not contain attestation");
+                };
+                let mut slot = attestation_slot_out
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("source attestation mutex poisoned"))?;
+                *slot = Some(attestation);
+                Ok(())
+            }))
+            .maybe_pccs_url(pccs_url.clone())
+            .build()
+            .into_client()?;
+        let mut kms_client = KmsClient::new(client);
 
-        if quote_enabled {
-            let tmp_ca = kms_client.get_temp_ca_cert().await?;
-            let (ra_cert, ra_key) = gen_ra_cert(tmp_ca.temp_ca_cert, tmp_ca.temp_ca_key).await?;
-            let ra_client = RaClient::new_mtls(other_kms_url.into(), ra_cert, ra_key, pccs_url)
-                .context("Failed to create client")?;
-            kms_client = KmsClient::new(ra_client);
-        }
+        let tmp_ca = kms_client.get_temp_ca_cert().await?;
+        let (ra_cert, ra_key) = gen_ra_cert(tmp_ca.temp_ca_cert, tmp_ca.temp_ca_key).await?;
+        let ra_client = RaClient::new_mtls(other_kms_url.into(), ra_cert, ra_key, pccs_url)
+            .context("Failed to create client")?;
+        kms_client = KmsClient::new(ra_client);
+        let source_attestation = attestation_slot
+            .lock()
+            .map_err(|_| anyhow::anyhow!("source attestation mutex poisoned"))?
+            .clone()
+            .context("Missing source KMS attestation")?;
+        ensure_kms_allowed(cfg, &source_attestation)
+            .await
+            .context("Source KMS is not allowed for onboarding")?;
 
         let info = dstack_client().info().await.context("Failed to get info")?;
         let keys_res = kms_client
@@ -258,15 +284,7 @@ impl Keys {
             KeyPair::from_pem(&tmp_ca_key_pem).context("Failed to parse tmp CA key")?;
         let ecdsa_key =
             SigningKey::from_slice(&root_k256_key).context("Failed to parse ECDSA key")?;
-        Self::from_keys(
-            tmp_ca_key,
-            ca_key,
-            rpc_key,
-            ecdsa_key,
-            domain,
-            quote_enabled,
-        )
-        .await
+        Self::from_keys(tmp_ca_key, ca_key, rpc_key, ecdsa_key, domain).await
     }
 
     fn store(&self, cfg: &KmsConfig) -> Result<()> {
@@ -310,16 +328,9 @@ pub(crate) async fn update_certs(cfg: &KmsConfig) -> Result<()> {
     let domain = domain.trim();
 
     // Regenerate certificates using existing keys
-    let keys = Keys::from_keys(
-        tmp_ca_key,
-        ca_key,
-        rpc_key,
-        k256_key,
-        domain,
-        cfg.onboard.quote_enabled,
-    )
-    .await
-    .context("Failed to regenerate certificates")?;
+    let keys = Keys::from_keys(tmp_ca_key, ca_key, rpc_key, k256_key, domain)
+        .await
+        .context("Failed to regenerate certificates")?;
 
     // Write the new certificates to files
     keys.store_certs(cfg)?;
@@ -328,24 +339,14 @@ pub(crate) async fn update_certs(cfg: &KmsConfig) -> Result<()> {
 }
 
 pub(crate) async fn bootstrap_keys(cfg: &KmsConfig) -> Result<()> {
-    let keys = Keys::generate(
-        &cfg.onboard.auto_bootstrap_domain,
-        cfg.onboard.quote_enabled,
-    )
-    .await
-    .context("Failed to generate keys")?;
+    ensure_self_kms_allowed(cfg)
+        .await
+        .context("KMS is not allowed to auto-bootstrap")?;
+    let keys = Keys::generate(&cfg.onboard.auto_bootstrap_domain)
+        .await
+        .context("Failed to generate keys")?;
     keys.store(cfg)?;
     Ok(())
-}
-
-fn dstack_client() -> DstackGuestClient<PrpcClient> {
-    let address = dstack_types::dstack_agent_address();
-    let http_client = PrpcClient::new(address);
-    DstackGuestClient::new(http_client)
-}
-
-async fn app_attest(report_data: Vec<u8>) -> Result<AttestResponse> {
-    dstack_client().attest(RawQuoteArgs { report_data }).await
 }
 
 async fn attest_keys(p256_pubkey: &[u8], k256_pubkey: &[u8]) -> Result<Vec<u8>> {
@@ -365,13 +366,6 @@ fn keccak256(msg: &[u8]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
-fn pad64(hash: [u8; 32]) -> Vec<u8> {
-    let mut padded = Vec::with_capacity(64);
-    padded.extend_from_slice(&hash);
-    padded.resize(64, 0);
-    padded
-}
-
 async fn gen_ra_cert(ca_cert_pem: String, ca_key_pem: String) -> Result<(String, String)> {
     use ra_tls::cert::CertRequest;
     use ra_tls::rcgen::{KeyPair, PKCS_ECDSA_P256_SHA256};
@@ -384,7 +378,7 @@ async fn gen_ra_cert(ca_cert_pem: String, ca_key_pem: String) -> Result<(String,
         .await
         .context("Failed to get quote")?;
     let attestation =
-        VersionedAttestation::from_scale(&response.attestation).context("Invalid attestation")?;
+        VersionedAttestation::from_bytes(&response.attestation).context("Invalid attestation")?;
     let req = CertRequest::builder()
         .subject("RA-TLS TEMP Cert")
         .attestation(&attestation)

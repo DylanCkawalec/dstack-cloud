@@ -27,8 +27,14 @@ use luks2::{
     LuksAf, LuksConfig, LuksDigest, LuksHeader, LuksJson, LuksKdf, LuksKeyslot, LuksSegment,
     LuksSegmentSize,
 };
-use ra_rpc::client::{CertInfo, RaClient, RaClientConfig};
-use ra_tls::cert::{generate_ra_cert, CertConfigV2};
+use ra_rpc::{
+    client::{CertInfo, RaClient, RaClientConfig},
+    Attestation,
+};
+use ra_tls::{
+    attestation::QuoteContentType,
+    cert::{generate_ra_cert, CertConfigV2, CertSigningRequestV2, Csr},
+};
 use rand::Rng as _;
 use safe_write::safe_write;
 use scopeguard::defer;
@@ -53,6 +59,29 @@ use ra_tls::rcgen::{KeyPair, PKCS_ECDSA_P256_SHA256};
 use serde_human_bytes as hex_bytes;
 use serde_json::Value;
 use tpm_attest::{self as tpm, TpmContext};
+
+async fn sign_cert_request(
+    cert_client: &CertRequestClient,
+    key: &KeyPair,
+    config: CertConfigV2,
+) -> Result<Vec<String>> {
+    let pubkey = key.public_key_der();
+    let report_data = QuoteContentType::RaTlsCert.to_report_data(&pubkey);
+    let attestation = Attestation::quote(&report_data)
+        .context("Failed to get quote for cert pubkey")?
+        .into_versioned();
+    let csr = CertSigningRequestV2 {
+        confirm: "please sign cert:".to_string(),
+        pubkey,
+        config,
+        attestation,
+    };
+    let signature = csr.signed_by(key).context("Failed to sign the CSR")?;
+    cert_client
+        .sign_csr(&csr, &signature)
+        .await
+        .context("Failed to sign the CSR")
+}
 
 mod config_id_verifier;
 
@@ -501,8 +530,7 @@ impl<'a> GatewayContext<'a> {
             not_before: None,
             not_after: Some(cert_not_after),
         };
-        let certs = cert_client
-            .request_cert(&key, config, None)
+        let certs = sign_cert_request(&cert_client, &key, config)
             .await
             .context("Failed to request cert")?;
         let client_cert = certs.join("\n");
@@ -521,8 +549,7 @@ impl<'a> GatewayContext<'a> {
             not_before: None,
             not_after: Some(cert_not_after),
         };
-        let certs_with_quote = cert_client
-            .request_cert(&key, config_with_quote, None)
+        let certs_with_quote = sign_cert_request(&cert_client, &key, config_with_quote)
             .await
             .context("Failed to request cert with quote")?;
         let client_cert_with_quote = certs_with_quote.join("\n");
@@ -683,7 +710,7 @@ async fn do_sys_setup(stage0: Stage0<'_>) -> Result<()> {
     if stage0.shared.app_compose.secure_time {
         info!("Waiting for the system time to be synchronized");
         cmd! {
-            chronyc waitsync 20 0.1;
+            chronyc waitsync 30 0.1 0 5;
         }
         .context("Failed to sync system time")?;
     } else {
@@ -1297,6 +1324,12 @@ impl<'a> Stage0<'a> {
 
         if instance_info.app_id.is_empty() {
             instance_info.app_id = truncated_compose_hash.to_vec();
+        }
+        if instance_info.app_id.len() != 20 {
+            bail!(
+                "Invalid app id length: expected 20 bytes, got {}",
+                instance_info.app_id.len()
+            );
         }
 
         let disk_reusable = !key_provider.is_none();

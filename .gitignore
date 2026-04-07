@@ -1,7 +1,8 @@
 /target
 /certs
 /build-config.sh
-/build
+/build/*
+!/build/shared/
 generated/
 node_modules/
 /.cargo
@@ -10,3 +11,4 @@ node_modules/
 .claude/settings.local.json
 __pycache__
 .planning/
+/vmm/src/console_v1.html

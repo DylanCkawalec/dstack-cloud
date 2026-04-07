@@ -12,6 +12,7 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 cc-eventlog.workspace = true
+ciborium.workspace = true
 dcap-qvl.workspace = true
 dstack-types.workspace = true
 ez-hash.workspace = true
@@ -31,6 +32,7 @@ nsm-attest.workspace = true
 nsm-qvl.workspace = true
 tpm-qvl.workspace = true
 tpm-types.workspace = true
+tracing.workspace = true
 insta.workspace = true
 errify.workspace = true
 
