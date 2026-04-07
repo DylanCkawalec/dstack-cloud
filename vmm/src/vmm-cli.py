@@ -1653,8 +1653,11 @@ def main():
         "--local-key-provider", action="store_true", help="Enable local key provider"
     )
     compose_parser.add_argument(
-        '--key-provider', choices=['none', 'kms', 'local', 'tpm'], default=None,
-        help='Override key provider type (none, kms, local, or tpm)')
+        "--key-provider",
+        choices=["none", "kms", "local", "tpm"],
+        default=None,
+        help="Override key provider type (none, kms, local, or tpm)",
+    )
     compose_parser.add_argument(
         "--key-provider-id",
         default=None,
