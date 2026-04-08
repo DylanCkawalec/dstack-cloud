@@ -381,7 +381,7 @@ fn cmd_quote_report(args: QuoteReportArgs) -> Result<()> {
     };
     let attestation = Attestation::quote(&report_data).context("Failed to get attestation")?;
     let request = VerificationRequestJson {
-        attestation: hex::encode(attestation.into_versioned().to_scale()),
+        attestation: hex::encode(attestation.into_versioned().to_scale()?),
     };
 
     let json =
@@ -417,10 +417,10 @@ fn cmd_attest(args: AttestArgs) -> Result<()> {
     let app_id = decode_app_id(args.app_id.as_deref())?;
     let attestation = Attestation::quote_with_app_id(&report_data, app_id)
         .context("Failed to get attestation")?;
-    let attestation = attestation.into_versioned().to_scale();
+    let attestation = attestation.into_versioned().to_scale()?;
 
     if args.hex {
-        let encoded = hex::encode(attestation);
+        let encoded = hex::encode(&attestation);
         if let Some(output) = args.output {
             fs::write(&output, encoded).context("Failed to write attestation hex")?;
         } else {
@@ -460,6 +460,7 @@ fn cmd_attest_info(args: AttestInfoArgs) -> Result<()> {
                     println!("event_log_entries: {}", tdx.event_log.len());
                     println!("event_log_json_bytes: {}", event_log_json.len());
                 }
+
                 None => {
                     println!("tdx_quote_bytes: 0");
                     println!("event_log_entries: 0");
@@ -473,6 +474,11 @@ fn cmd_attest_info(args: AttestInfoArgs) -> Result<()> {
                 }
                 None => println!("tpm_quote_bytes: 0"),
             }
+        }
+        VersionedAttestation::V1 { attestation } => {
+            println!("version: V1");
+            println!("platform: {:?}", attestation.platform);
+            println!("stack: {:?}", attestation.stack);
         }
     }
 
@@ -510,6 +516,9 @@ fn cmd_attest_json(args: AttestJsonArgs) -> Result<()> {
                 "tpm_quote": tpm_quote,
             })
         }
+        VersionedAttestation::V1 { attestation } => {
+            serde_json::to_value(&attestation).context("Failed to serialize V1 attestation")?
+        }
     };
 
     let output = serde_json::to_string_pretty(&json).context("Failed to serialize JSON")?;
@@ -532,7 +541,7 @@ fn cmd_attest_strip(args: AttestStripArgs) -> Result<()> {
     let output = args
         .output
         .unwrap_or_else(|| PathBuf::from("attestation.strip.bin"));
-    fs::write(&output, stripped.to_scale()).context("Failed to write stripped attestation")?;
+    fs::write(&output, stripped.to_scale()?).context("Failed to write stripped attestation")?;
     Ok(())
 }
 

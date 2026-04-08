@@ -86,8 +86,17 @@ fn platform_from_legacy_quote(quote: AttestationQuote) -> PlatformEvidence {
         AttestationQuote::DstackTdx(TdxQuote { quote, event_log }) => {
             PlatformEvidence::Tdx { quote, event_log }
         }
-        AttestationQuote::DstackGcpTdx => PlatformEvidence::GcpTdx,
-        AttestationQuote::DstackNitroEnclave => PlatformEvidence::NitroEnclave,
+        AttestationQuote::DstackGcpTdx(DstackGcpTdxQuote {
+            tdx_quote: TdxQuote { quote, event_log },
+            tpm_quote,
+        }) => PlatformEvidence::GcpTdx {
+            quote,
+            event_log,
+            tpm_quote,
+        },
+        AttestationQuote::DstackNitroEnclave(DstackNitroQuote { nsm_quote }) => {
+            PlatformEvidence::NitroEnclave { nsm_quote }
+        }
     }
 }
 
@@ -96,16 +105,25 @@ fn platform_into_legacy_quote(platform: PlatformEvidence) -> AttestationQuote {
         PlatformEvidence::Tdx { quote, event_log } => {
             AttestationQuote::DstackTdx(TdxQuote { quote, event_log })
         }
-        PlatformEvidence::GcpTdx => AttestationQuote::DstackGcpTdx,
-        PlatformEvidence::NitroEnclave => AttestationQuote::DstackNitroEnclave,
+        PlatformEvidence::GcpTdx {
+            quote,
+            event_log,
+            tpm_quote,
+        } => AttestationQuote::DstackGcpTdx(DstackGcpTdxQuote {
+            tdx_quote: TdxQuote { quote, event_log },
+            tpm_quote,
+        }),
+        PlatformEvidence::NitroEnclave { nsm_quote } => {
+            AttestationQuote::DstackNitroEnclave(DstackNitroQuote { nsm_quote })
+        }
     }
 }
 
 fn platform_attestation_mode(platform: &PlatformEvidence) -> AttestationMode {
     match platform {
         PlatformEvidence::Tdx { .. } => AttestationMode::DstackTdx,
-        PlatformEvidence::GcpTdx => AttestationMode::DstackGcpTdx,
-        PlatformEvidence::NitroEnclave => AttestationMode::DstackNitroEnclave,
+        PlatformEvidence::GcpTdx { .. } => AttestationMode::DstackGcpTdx,
+        PlatformEvidence::NitroEnclave { .. } => AttestationMode::DstackNitroEnclave,
     }
 }
 
@@ -555,7 +573,7 @@ impl AttestationV1 {
             PlatformEvidence::Tdx { quote, .. } => {
                 decode_mr_tdx_from_quote(boottime_mr, &mr_key_provider, quote, runtime_events)?
             }
-            PlatformEvidence::GcpTdx | PlatformEvidence::NitroEnclave => {
+            PlatformEvidence::GcpTdx { .. } | PlatformEvidence::NitroEnclave { .. } => {
                 bail!("Unsupported attestation quote");
             }
         };
@@ -621,7 +639,7 @@ impl AttestationV1 {
                 verify_tdx_quote_with_events(pccs_url, quote, &runtime_events, &report_data)
                     .await?,
             ),
-            PlatformEvidence::GcpTdx | PlatformEvidence::NitroEnclave => {
+            PlatformEvidence::GcpTdx { .. } | PlatformEvidence::NitroEnclave { .. } => {
                 bail!(
                     "Unsupported attestation mode: {:?}",
                     platform_attestation_mode(&platform)
