@@ -4,7 +4,9 @@
 
 //! Integration test: verify Nitro Enclave attestation end-to-end
 
-use dstack_attest::attestation::{AttestationQuote, DstackVerifiedReport, VersionedAttestation};
+use dstack_attest::attestation::{
+    AttestationQuote, DstackVerifiedReport, VersionedAttestation,
+};
 use nsm_qvl::{AttestationDocument, CoseSign1};
 use std::time::{Duration, SystemTime};
 
@@ -16,7 +18,9 @@ async fn verify_nitro_attestation_bin() {
     // Decode VersionedAttestation from SCALE
     let versioned = VersionedAttestation::from_scale(NITRO_ATTESTATION_BIN)
         .expect("decode VersionedAttestation");
-    let attestation = versioned.into_inner();
+    let VersionedAttestation::V0 { attestation } = versioned else {
+        panic!("expected V0 attestation");
+    };
 
     let app_info = attestation.decode_app_info(false).unwrap();
     let app_info_str = serde_json::to_string_pretty(&app_info).unwrap();
